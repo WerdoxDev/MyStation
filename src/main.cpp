@@ -4,8 +4,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Wire.h>
-#include "esp_sleep.h"
 #include <sys/time.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
+#include <esp_pm.h>
+#include "driver/periph_ctrl.h"
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -29,17 +32,16 @@ volatile bool isRadioShown = false;
 volatile bool displayOn = true;
 volatile unsigned long displayOnSince = 0;
 const unsigned long displayAutoOffDelay = 15000;
-volatile bool justWoke = false;
 
 TaskHandle_t clockTaskHandle = NULL;
+TaskHandle_t displayTaskHandle = NULL;
 TaskHandle_t temperatureTaskHandle = NULL;
+SemaphoreHandle_t touchSem;
 
 int intensity = 0;
 int maxIntensity = 3;
 unsigned long lastTouchTime = 0;
-unsigned long lastActivityTime = 0;
 const unsigned long debounceDelay = 300;
-const unsigned long autoOffDelay = 15000;
 
 uint64_t boot_timer_us = 0;
 uint64_t boot_epoch_s = 0;
@@ -87,6 +89,7 @@ void readTemperatureOnce()
 
 void clockTask(void *parameter)
 {
+   DCF.Start();
    digitalWrite(DCF_PON, LOW);
 
    for (;;)
@@ -114,6 +117,7 @@ void clockTask(void *parameter)
          // setTime(dcfTime);
          setTimeFromDCF(dcfTime);
 
+         DCF.Stop();
          digitalWrite(DCF_PON, HIGH);
          clockTaskHandle = NULL;
          vTaskDelete(NULL);
@@ -127,6 +131,14 @@ void startClockSyncTask()
       xTaskCreate(clockTask, "ClockTask", 4096, NULL, 1, &clockTaskHandle);
 }
 
+void IRAM_ATTR touchISR()
+{
+   BaseType_t woken = pdFALSE;
+   xSemaphoreGiveFromISR(touchSem, &woken);
+   if (woken)
+      portYIELD_FROM_ISR();
+}
+
 void displayTask(void *parameter)
 {
    bool oledOff = false;
@@ -138,7 +150,7 @@ void displayTask(void *parameter)
          displayOn = false;
       }
 
-      // Light sleep when display is off and initialized
+      // Turn off LCD when display is off and initialized
       if (!displayOn && isInitialized)
       {
          if (!oledOff)
@@ -147,36 +159,22 @@ void displayTask(void *parameter)
             display.display();
             display.ssd1306_command(SSD1306_DISPLAYOFF);
             oledOff = true;
-            digitalWrite(SHT, LOW);
-            digitalWrite(DCF_PON, HIGH);
+            intensity = 0;
+            ledcDetachPin(LED);
+            digitalWrite(LED, LOW);
+            Wire.end();
          }
-
-         gpio_wakeup_enable((gpio_num_t)TOUCH, GPIO_INTR_HIGH_LEVEL);
-         esp_sleep_enable_gpio_wakeup();
-         esp_light_sleep_start();
-
-         vTaskDelay(500 / portTICK_PERIOD_MS); // Short delay to allow wakeup processing
-
-         // Woke up: refresh temp
-         displayOn = true;
-         displayOnSince = millis();
-         justWoke = true;
-         lastTouchTime = millis();
-         display.ssd1306_command(SSD1306_DISPLAYON);
-         oledOff = false;
-         // struct timeval tv;
-         // gettimeofday(&tv, nullptr);
-
-         // Woke up: refresh temp, then re-sync time to correct RTC drift from sleep
-         readTemperatureOnce();
-         // startClockSyncTask();
+         // Block indefinitely — touch ISR will notify us via touchTask
+         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
          continue;
       }
 
       if (oledOff)
       {
+         Wire.begin();
          display.ssd1306_command(SSD1306_DISPLAYON);
          oledOff = false;
+         readTemperatureOnce();
       }
 
       display.clearDisplay();
@@ -291,10 +289,10 @@ void temperatureTask(void *parameter)
 {
    for (;;)
    {
-      // Skip sensor reading during sleep or time sync
+      // Block indefinitely while display is off — notified by touchTask on wake
       if (!displayOn)
       {
-         vTaskDelay(1000 / portTICK_PERIOD_MS);
+         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
          continue;
       }
 
@@ -336,52 +334,31 @@ void touchTask(void *parameter)
 {
    for (;;)
    {
-      // Ignore touches until released after wake from sleep
-      if (justWoke)
-      {
-         if (digitalRead(TOUCH) == LOW)
-            justWoke = false;
-         vTaskDelay(50 / portTICK_PERIOD_MS);
-         continue;
-      }
+      // Sleep until the touch ISR fires
+      xSemaphoreTake(touchSem, portMAX_DELAY);
 
       unsigned long currentTime = millis();
-      if (digitalRead(TOUCH) == HIGH)
+      if (currentTime - lastTouchTime < debounceDelay)
+         continue;
+      lastTouchTime = currentTime;
+
+      if (!displayOn)
       {
-         if (currentTime - lastTouchTime > debounceDelay)
-         {
-            lastTouchTime = currentTime;
-
-            if (!displayOn)
-            {
-               // Wake display only, don't toggle LED
-               displayOn = true;
-               displayOnSince = currentTime;
-            }
-            else
-            {
-               // Reset auto-off timer and toggle LED
-               displayOnSince = currentTime;
-               lastActivityTime = currentTime;
-               intensity++;
-               if (intensity > maxIntensity)
-               {
-                  intensity = 0;
-               }
-               int brightness = (intensity * 1023) / maxIntensity;
-               analogWrite(LED, brightness);
-            }
-         }
+         displayOn = true;
+         displayOnSince = currentTime;
+         // Wake display and temperature tasks
+         xTaskNotifyGive(displayTaskHandle);
+         xTaskNotifyGive(temperatureTaskHandle);
       }
-
-      // LED auto-off check
-      if (intensity > 0 && currentTime - lastActivityTime > autoOffDelay)
+      else
       {
-         intensity = 0;
-         analogWrite(LED, 0);
+         displayOnSince = currentTime;
+         intensity++;
+         if (intensity > maxIntensity)
+            intensity = 0;
+         int brightness = (intensity * 1023) / maxIntensity;
+         analogWrite(LED, brightness);
       }
-
-      vTaskDelay(50 / portTICK_PERIOD_MS);
    }
 }
 
@@ -409,6 +386,39 @@ void setup()
    digitalWrite(SHT, LOW);
    digitalWrite(DCF_PON, HIGH);
 
+   // Unused GPIO pins pulled low to prevent floating inputs drawing current
+   pinMode(5, INPUT_PULLDOWN);
+   pinMode(6, INPUT_PULLDOWN);
+   pinMode(7, INPUT_PULLDOWN);
+
+   // Disable WiFi and Bluetooth radios — not used, major power drain
+   esp_wifi_stop();
+   esp_wifi_deinit();
+   esp_bt_controller_disable();
+   esp_bt_controller_deinit();
+
+   // Gate clocks of all unused peripherals
+   periph_module_disable(PERIPH_UART1_MODULE);
+   periph_module_disable(PERIPH_SPI2_MODULE);
+   periph_module_disable(PERIPH_I2S1_MODULE);
+   periph_module_disable(PERIPH_UHCI0_MODULE);
+   periph_module_disable(PERIPH_RMT_MODULE);
+   periph_module_disable(PERIPH_TWAI_MODULE);
+   periph_module_disable(PERIPH_SARADC_MODULE);
+   periph_module_disable(PERIPH_RSA_MODULE);
+   periph_module_disable(PERIPH_AES_MODULE);
+   periph_module_disable(PERIPH_SHA_MODULE);
+   periph_module_disable(PERIPH_HMAC_MODULE);
+   periph_module_disable(PERIPH_DS_MODULE);
+
+   // Dynamic frequency scaling: auto-reduce CPU clock when idle, no sleep
+   esp_pm_config_esp32c3_t pm_config = {
+       .max_freq_mhz = 10,
+       .min_freq_mhz = 10,
+       .light_sleep_enable = false,
+   };
+   esp_pm_configure(&pm_config);
+
    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
    {
       while (1)
@@ -416,11 +426,12 @@ void setup()
    }
 
    // Start display and touch tasks (full interface shown immediately)
-   xTaskCreate(displayTask, "DisplayTask", 4096, NULL, 1, NULL);
-   xTaskCreate(touchTask, "TouchTask", 4096, NULL, 1, NULL);
+   touchSem = xSemaphoreCreateBinary();
+   xTaskCreate(displayTask, "DisplayTask", 4096, NULL, 1, &displayTaskHandle);
+   xTaskCreate(touchTask, "TouchTask", 2048, NULL, 2, NULL);
+   attachInterrupt(digitalPinToInterrupt(TOUCH), touchISR, RISING);
 
    // Start DCF time sync, temperature, and daily re-sync tasks
-   DCF.Start();
    xTaskCreate(temperatureTask, "TemperatureTask", 4096, NULL, 1, &temperatureTaskHandle);
    startClockSyncTask();
    xTaskCreate(dailyTask, "DailyTask", 4096, NULL, 1, NULL);
